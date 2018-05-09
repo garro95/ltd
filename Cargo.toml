@@ -1,0 +1,9 @@
+[package]
+name = "ltd"
+version = "0.1.0"
+authors = ["Gianmarco Garrisi <gianmarcogarrisi@tutanota.com>"]
+
+[dependencies]
+petgraph = "0.4"
+quicli = "0.2"
+rand = "0.4"
