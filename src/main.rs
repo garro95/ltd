@@ -2,6 +2,7 @@ extern crate petgraph;
 extern crate rand;
 
 use petgraph::prelude::*;
+use petgraph::algo::{DfsSpace, has_path_connecting, kosaraju_scc};
 use petgraph::dot::Dot;
 use rand::{SeedableRng, distributions::{Sample, Range}};
 
@@ -39,41 +40,34 @@ fn main() {
             None => std::cmp::Ordering::Equal
         }
     });
-    let mut connected = vec![false; N];
-    let mut unconnected = N;
+    //let mut connected = vec![false; N];
+    //let mut unconnected = N;
     let mut indegree = vec![0;N];
-    let mut outdegree = vec![0, N];
+    let mut outdegree = vec![0;N];
     let mut phisical = Graph::new();
     for i in 0..N {
         phisical.add_node(i);
     }
-    // Take the first edge
-    let e = &sorted_edges[0];
-    let a = e.source();
-    let b = e.source();
-    phisical.add_edge(a, b, e.weight);
-    connected[a.index()] = true;
-    outdegree[a.index()] +=1;
-    connected[b.index()] = true;
-    indegree[b.index()] += 1;
-    // in this first iteration, take the most heavy edges that strongly connects the nodes
-    for e in sorted_edges.iter().skip(1) {
+    // Try to take the heaviest Hamilton Cycle
+    let mut workspace = DfsSpace::new(&phisical);
+    for e in &sorted_edges {
         let a = e.source();
         let b = e.target();
-        // check if the target node is not yet connected
-        if !connected[b.index()] {
-            // check that none of the nodes has yet reached its maximum indegree/outdegree
-            if outdegree[a.index()] < DELTA && indegree[b.index()] < DELTA {
-                phisical.add_edge(a, b, e.weight);
-                outdegree[a.index()] +=1;
-                connected[b.index()] = true;
-                unconnected -= 1;
+        let w = e.weight;
+        if outdegree[a.index()] < DELTA && indegree[b.index()] < DELTA && 
+            !has_path_connecting(&phisical, a, b, Some(&mut workspace)) {
+                phisical.add_edge(a, b, w);
+                outdegree[a.index()] += 1;
                 indegree[b.index()] += 1;
-            }
         }
-        if unconnected == 0 {break}
     }
-    // now that all the nodes can reach each other, 
+
+    // If there are more than one sccs, try to connect them
+    let sccs = kosaraju_scc(&phisical);
+    if sccs.len() > 1 {
+        
+    }
+    
 
     let dot = Dot::new(&phisical);
     println!("{:?}", dot);
