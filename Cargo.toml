@@ -7,3 +7,4 @@ authors = ["Gianmarco Garrisi <gianmarcogarrisi@tutanota.com>"]
 petgraph = "0.4"
 quicli = "0.2"
 rand = "0.4"
+rayon = "1"
