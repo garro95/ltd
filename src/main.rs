@@ -27,6 +27,7 @@ use std::io::Write;
 use petgraph::prelude::*;
 use petgraph::graph::EdgeReference;
 use petgraph::dot::Dot;
+use petgraph::algo::astar;
 
 use rand::{SeedableRng, distributions::{Sample, Range}};
 
@@ -56,7 +57,7 @@ struct Interface {
     delta: usize,
     /// Random seed. The traffic is genearated using a seeded random number generator,
     /// in order to be consistent between two run. You can change it to change the result
-    /// of the computation.
+    /// of the computation. Can be an integer ranging from 1 up to 340,282,366,920,938,463,463,374,607,431,768,211,455
     #[structopt(long="seed", short="s", default_value="1234", parse(from_str="parse_seed"))]
     seed: [u32;4],
     /// If specified, the final computed graph will be output on the specified file using graphviz.
@@ -111,15 +112,15 @@ main!(|args:Interface| {
     logic.remove_edge(e);
 
     // If there is still space, try to add more arcs, starting from the heaviest
+    let mut sorted_edges = Vec::from(logic.raw_edges());
+    sorted_edges.par_sort_unstable_by(|e1, e2| {
+        match e2.weight.partial_cmp(&e1.weight) {
+            Some(o) => o,
+            None => std::cmp::Ordering::Equal
+        }
+    });
     if args.delta > 1 {
-        let mut sorted_edges = Vec::from(logic.raw_edges());
-        sorted_edges.par_sort_unstable_by(|e1, e2| {
-            match e2.weight.partial_cmp(&e1.weight) {
-                Some(o) => o,
-                None => std::cmp::Ordering::Equal
-            }
-        });
-        for e in sorted_edges {
+        for e in &sorted_edges {
             if outdegree[e.source().index()] < args.delta && indegree[e.target().index()] < args.delta {
                 phisical.add_edge(e.source(), e.target(), e.weight);
                 outdegree[e.source().index()] += 1;
@@ -128,7 +129,20 @@ main!(|args:Interface| {
         }
     }
 
-    // TODO: Assign all the remaining traffic to the existing paths.
+    // Assign all the remaining traffic to the existing paths.
+    for e in sorted_edges {
+        if !phisical.contains_edge(e.source(), e.target()) {
+            let path = astar(&phisical, e.source(), |t| t == e.target(), |e| *e.weight(), |_| 0.0).unwrap().1;
+            let mut a = path[0];
+            for b in path.into_iter().skip(1) {
+                let te = phisical.find_edge(a, b).unwrap();
+                *(phisical.edge_weight_mut(te).unwrap()) += e.weight;
+                a = b;
+            }
+        }
+    }
+
+    // TODO: case of splitted traffic
 
     output_result(&phisical, args.output_file);
 });
