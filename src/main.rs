@@ -69,80 +69,45 @@ struct Interface {
     /// in parallel on more lightpaths.
     #[structopt(long="split", short="s")]
     splittable: bool,
+    /// Specify if a manhattan topology should be used and, in that case, the length of a row
+    #[structopt(long="manhattan", short="m")]
+    manhattan: Option<usize>
 }
 
 main!(|args:Interface| {
-    let mut logic = create_logical_topology(args.n, args.seed);
-    // Heuristically find a heavy Hamilton cycle
-    let start = find_start(&logic);
-
-    // Create a graph containing the found cycle
-    let mut phisical: Graph<usize, f64> = Graph::new();
-    for i in 0..args.n {
-        phisical.add_node(i);
-    }
-    let mut connected = vec![false; args.n];
-    let mut unconnected = args.n-1;
-    connected[start] = true;
-    let (mut indegree, mut outdegree) = (vec![0;args.n], vec![0;args.n]);
-    let mut a = NodeIndex::new(start);
-    while unconnected > 0 {
-        let edge_id;
-        {
-            let e:EdgeReference<_> = logic.edges_directed(a, Direction::Outgoing)
-                .filter(|e| !connected[e.target().index()])
-                .max_by(|e1, e2| {
-                    match e2.weight().partial_cmp(e1.weight()) {
-                        Some(o) => o,
-                        None => std::cmp::Ordering::Equal
-                    }
-                }).unwrap();
-            phisical.add_edge(a, e.target(), *e.weight());
-            edge_id = e.id();
-            unconnected -= 1;
-            connected[e.target().index()] = true;
-            outdegree[a.index()] += 1;
-            indegree[e.target().index()] += 1;
-            a = e.target();
-        }
-        logic.remove_edge(edge_id);
-    }
-    let e = logic.find_edge(a, NodeIndex::new(start)).unwrap();
-    phisical.add_edge(a, NodeIndex::new(start), *logic.edge_weight(e).unwrap());
-    logic.remove_edge(e);
-
-    // If there is still space, try to add more arcs, starting from the heaviest
-    let mut sorted_edges = Vec::from(logic.raw_edges());
-    sorted_edges.par_sort_unstable_by(|e1, e2| {
-        match e2.weight.partial_cmp(&e1.weight) {
-            Some(o) => o,
-            None => std::cmp::Ordering::Equal
-        }
-    });
-    if args.delta > 1 {
-        for e in &sorted_edges {
-            if outdegree[e.source().index()] < args.delta && indegree[e.target().index()] < args.delta {
-                phisical.add_edge(e.source(), e.target(), e.weight);
-                outdegree[e.source().index()] += 1;
-                indegree[e.target().index()] += 1;
-            }
-        }
-    }
+    let mut logical = create_logical_topology(args.n, args.seed);
+    // Heuristically find a heavy Hamilton cycle (like a multi start)
+    let mut phisical = if let Some(r) = args.manhattan {
+        create_manhattan_physical_topology(logical.node_count(), r)
+    } else {
+        create_opportunistic_physical_topology(&mut logical, args.splittable, args.delta)
+    };
 
     // Assign all the remaining traffic to the existing paths.
-    for e in sorted_edges {
-        if !phisical.contains_edge(e.source(), e.target()) {
-            let path = astar(&phisical, e.source(), |t| t == e.target(), |e| *e.weight(), |_| 0.0).unwrap().1;
-            let mut a = path[0];
-            for b in path.into_iter().skip(1) {
-                let te = phisical.find_edge(a, b).unwrap();
-                *(phisical.edge_weight_mut(te).unwrap()) += e.weight;
-                a = b;
+    if args.splittable {
+        // TODO: case of splitted traffic
+        
+        
+    } else {
+        let mut sorted_edges = Vec::from(logical.raw_edges());
+        sorted_edges.par_sort_unstable_by(|e1, e2| {
+            match e2.weight.partial_cmp(&e1.weight) {
+                Some(o) => o,
+                None => std::cmp::Ordering::Equal
+            }
+        });
+        for e in sorted_edges {
+            if !phisical.contains_edge(e.source(), e.target()) {
+                let path = astar(&phisical, e.source(), |t| t == e.target(), |e| *e.weight(), |_| 0.0).unwrap().1;
+                let mut a = path[0];
+                for b in path.into_iter().skip(1) {
+                    let te = phisical.find_edge(a, b).unwrap();
+                    *(phisical.edge_weight_mut(te).unwrap()) += e.weight;
+                    a = b;
+                }
             }
         }
     }
-
-    // TODO: case of splitted traffic
 
     output_result(&phisical, args.output_file);
 });
@@ -198,6 +163,129 @@ fn find_start(logic: &Graph<usize, f64>) -> usize {
     });
 
     max_weight.into_inner().unwrap().0
+}
+
+fn create_opportunistic_physical_topology(logical: &mut Graph<usize, f64>, remove_edges: bool, delta: usize)
+                                          -> Graph<usize, f64>{
+    let start = find_start(&logical);
+    let n = logical.node_count();
+    let (mut indegree, mut outdegree) = (vec![0;n], vec![0;n]);
+    // Create a graph containing the found cycle
+    let mut phisical: Graph<usize, f64> = Graph::new();
+    for i in 0..n {
+        phisical.add_node(i);
+    }
+
+    let mut connected = vec![false; n];
+    let mut unconnected = n-1;
+    connected[start] = true;
+    let mut a = NodeIndex::new(start);
+    while unconnected > 0 {
+        let edge_id;
+        {
+            let e:EdgeReference<_> = logical.edges_directed(a, Direction::Outgoing)
+                .filter(|e| !connected[e.target().index()])
+                .max_by(|e1, e2| {
+                    match e2.weight().partial_cmp(e1.weight()) {
+                        Some(o) => o,
+                        None => std::cmp::Ordering::Equal
+                    }
+                }).unwrap();
+            if remove_edges {
+                phisical.add_edge(a, e.target(), *e.weight());
+            } else {
+                phisical.add_edge(a, e.target(), 0.0);
+            }
+            edge_id = e.id();
+            unconnected -= 1;
+            connected[e.target().index()] = true;
+            outdegree[a.index()] += 1;
+            indegree[e.target().index()] += 1;
+            a = e.target();
+        }
+        if remove_edges {
+            logical.remove_edge(edge_id);
+        }
+    }
+    let e = logical.find_edge(a, NodeIndex::new(start)).unwrap();
+    if remove_edges {
+        phisical.add_edge(a, NodeIndex::new(start), *logical.edge_weight(e).unwrap());
+        logical.remove_edge(e);
+    } else {
+        phisical.add_edge(a, NodeIndex::new(start), 0.0);
+    }
+
+    // If there is still space, try to add more arcs, starting from the heaviest
+    let mut sorted_edges = Vec::from(logical.raw_edges());
+    sorted_edges.par_sort_unstable_by(|e1, e2| {
+        match e2.weight.partial_cmp(&e1.weight) {
+            Some(o) => o,
+            None => std::cmp::Ordering::Equal
+        }
+    });
+    if delta > 1 {
+        for e in &sorted_edges {
+            if outdegree[e.source().index()] < delta && indegree[e.target().index()] < delta
+                && !phisical.contains_edge(e.source(), e.target()){
+                    if remove_edges {
+                        phisical.add_edge(e.source(), e.target(), e.weight);
+                    } else {
+                        phisical.add_edge(e.source(), e.target(), 0.0);
+                    }
+                    outdegree[e.source().index()] += 1;
+                    indegree[e.target().index()] += 1;
+            }
+        }
+    }
+    phisical
+}
+
+fn create_manhattan_physical_topology(n:usize, r:usize) -> Graph<usize, f64>{
+    if n%r != 0 {
+        panic!("Cannot build a manhattan topology with the given dimentions");
+    }
+    let c = n/r;
+    let left = |i| {
+        if i % r == 0 {
+            i + r - 1
+        } else {
+            i - 1
+        }
+    };
+    let right = |i| {
+        if i%r == r-1 {
+            i + 1 -r
+        } else {
+            i + 1
+        }
+    };
+    let up = |i| {
+        if i/r == 0 {
+            n - r + i
+        } else {
+            i - r
+        }
+    };
+    let down = |i| {
+        if i/r == c-1 {
+            i%r
+        } else {
+            i + r
+        }
+    };
+    let mut physical = Graph::new();
+    for i in 0usize..n {
+        physical.add_node(i);
+    }
+
+    for i in 0usize..n {
+        physical.add_edge(NodeIndex::new(i), NodeIndex::new(left(i)), 0.0);
+        physical.add_edge(NodeIndex::new(i), NodeIndex::new(right(i)), 0.0);
+        physical.add_edge(NodeIndex::new(i), NodeIndex::new(up(i)), 0.0);
+        physical.add_edge(NodeIndex::new(i), NodeIndex::new(down(i)), 0.0);
+    }
+
+    physical
 }
 
 fn output_result(g: &Graph<usize, f64>, output_file: Option<PathBuf>) {
