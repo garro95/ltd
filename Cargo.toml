@@ -1,6 +1,6 @@
 [package]
 name = "ltd"
-version = "0.5.0"
+version = "0.7.0"
 authors = ["Gianmarco Garrisi <gianmarco.garrisi@studenti.polito.it>"]
 
 [dependencies]

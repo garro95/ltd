@@ -23,13 +23,15 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::ffi::OsString;
 use std::io::Write;
+use std::collections::VecDeque;
 
 use petgraph::prelude::*;
 use petgraph::graph::EdgeReference;
 use petgraph::dot::Dot;
-use petgraph::algo::astar;
+use petgraph::algo::{DfsSpace, astar, has_path_connecting};
 
-use rand::{SeedableRng, distributions::{Sample, Range}};
+use rand::{SeedableRng, XorShiftRng, distributions::{Sample, Range}};
+use rand::seq::sample_slice;
 
 use quicli::prelude::*;
 
@@ -67,7 +69,7 @@ struct Interface {
     output_file: Option<PathBuf>,
     /// Specify if it is possible to split the traffic on one node in order to send it
     /// in parallel on more lightpaths.
-    #[structopt(long="split", short="s")]
+    #[structopt(long="split", short="S")]
     splittable: bool,
     /// Specify if a manhattan topology should be used and, in that case, the length of a row
     #[structopt(long="manhattan", short="m")]
@@ -75,20 +77,82 @@ struct Interface {
 }
 
 main!(|args:Interface| {
-    let mut logical = create_logical_topology(args.n, args.seed);
+    let mut rng = XorShiftRng::from_seed(args.seed);
+    let logical = create_logical_topology(args.n, &mut rng);
     // Heuristically find a heavy Hamilton cycle (like a multi start)
     let mut phisical = if let Some(r) = args.manhattan {
         create_manhattan_physical_topology(logical.node_count(), r)
     } else {
-        create_opportunistic_physical_topology(&mut logical, args.splittable, args.delta)
+        create_opportunistic_physical_topology(&logical, args.delta)
     };
 
-    // Assign all the remaining traffic to the existing paths.
+    // Assign all the traffic to the existing paths.
     if args.splittable {
         // TODO: case of splitted traffic
-        
-        
+        let edges = logical.raw_edges();
+        //take the edges in random order
+        let edges = sample_slice(&mut rng, edges, edges.len());
+        let mut aux_graph = phisical.clone();
+        let mut q = VecDeque::new();
+        let mut taken = vec![false; args.n];
+        let mut state = vec![(0, 0.0);args.n]; //(occurrencies, traffic to deliver)
+        for e in edges {
+            aux_graph.clear_edges();
+            for t in &mut taken{
+                *t = false;
+            }
+            for s in &mut state {
+                *s = (0, 0.0);
+            }
+            let a = e.source();
+            let t = e.target();
+            let w = e.weight;
+            q.push_back(a);
+            // create a DAG
+            while let Some(a) = q.pop_front() {
+                if a != t && !taken[a.index()] {
+                    taken[a.index()] = true;
+                    let neighbors = phisical.neighbors(a).filter(|n| !taken[n.index()]);
+                    neighbors.clone().map(|n| state[n.index()]).for_each(|mut t| {t.0+=1;});
+                    q.extend(neighbors.clone());
+                    aux_graph.extend_with_edges(neighbors.map(|n| (a, n, 0.0)));
+                }
+            }
+            // divide the flow on the arcs
+            for t in &mut taken{
+                *t = false;
+            }
+            q.push_back(a);
+            state[a.index()].1 = w;
+            let mut space = DfsSpace::new(&aux_graph);
+            while let Some(a) = q.pop_front() {
+                if a!= t && !taken[a.index()] {
+                    taken[a.index()] = true;
+                    let neighbors_to_split: Vec<_> = aux_graph.neighbors(a)
+                        .filter(|n| has_path_connecting(&aux_graph, *n, t, Some(&mut space)))
+                        .collect();
+                    let divisor:usize = neighbors_to_split.iter().map(|n| state[n.index()].0).sum();
+                    for (n, mut s) in neighbors_to_split.iter().map(|n| (n, state[n.index()])) {
+                        /*s.1 += state[a.index()].1 / divisor * */
+                        let value = state[a.index()].1 / (neighbors_to_split.len() as f64);
+                        s.1 += value;
+                        let e;
+                        {
+                            e = phisical.find_edge(a, *n).unwrap();
+                        }
+                        *phisical.edge_weight_mut(e).unwrap() += value;
+                    }
+                }
+            }
+        }
     } else {
+        let edges = Vec::from(phisical.raw_edges());
+        for (i, e) in phisical.edge_weights_mut().enumerate() {
+            let (from, to) = (edges[i].source(), edges[i].target());
+            let idx = logical.find_edge(from, to).unwrap();
+            let weight = logical.edge_weight(idx).unwrap();
+            *e = *weight;
+        }
         let mut sorted_edges = Vec::from(logical.raw_edges());
         sorted_edges.par_sort_unstable_by(|e1, e2| {
             match e2.weight.partial_cmp(&e1.weight) {
@@ -107,13 +171,21 @@ main!(|args:Interface| {
                 }
             }
         }
+        // TODO: Check that all the traffic has been delivered
     }
 
-    output_result(&phisical, args.output_file);
+    println!("{}", phisical.edge_weights_mut().max_by(|a, b| {
+        match a.partial_cmp(&b) {
+            Some(o) => o,
+            None => std::cmp::Ordering::Equal
+        }
+    }).unwrap());
+    if let Some(output_file) = args.output_file {
+        output_result(&phisical, output_file);
+    }
 });
 
-fn create_logical_topology(nodes:usize, seed:[u32;4]) -> Graph<usize, f64>{
-    let mut rng = rand::XorShiftRng::from_seed(seed);
+fn create_logical_topology(nodes:usize, rng: &mut XorShiftRng) -> Graph<usize, f64>{
     let mut traffic_values = Range::new(0.0, 1.0);
 
     // Create a logical topology that describes the traffic from one node to each other.
@@ -125,7 +197,7 @@ fn create_logical_topology(nodes:usize, seed:[u32;4]) -> Graph<usize, f64>{
 
     for from in 0usize..nodes {
         for to in (0usize..nodes).filter(|&a| a != from) {
-            logic.add_edge(NodeIndex::new(from), NodeIndex::new(to), traffic_values.sample(&mut rng));
+            logic.add_edge(NodeIndex::new(from), NodeIndex::new(to), traffic_values.sample(rng));
         }
     }
     logic
@@ -165,7 +237,7 @@ fn find_start(logic: &Graph<usize, f64>) -> usize {
     max_weight.into_inner().unwrap().0
 }
 
-fn create_opportunistic_physical_topology(logical: &mut Graph<usize, f64>, remove_edges: bool, delta: usize)
+fn create_opportunistic_physical_topology(logical: &Graph<usize, f64>, delta: usize)
                                           -> Graph<usize, f64>{
     let start = find_start(&logical);
     let n = logical.node_count();
@@ -181,39 +253,24 @@ fn create_opportunistic_physical_topology(logical: &mut Graph<usize, f64>, remov
     connected[start] = true;
     let mut a = NodeIndex::new(start);
     while unconnected > 0 {
-        let edge_id;
-        {
-            let e:EdgeReference<_> = logical.edges_directed(a, Direction::Outgoing)
-                .filter(|e| !connected[e.target().index()])
-                .max_by(|e1, e2| {
-                    match e2.weight().partial_cmp(e1.weight()) {
-                        Some(o) => o,
-                        None => std::cmp::Ordering::Equal
-                    }
-                }).unwrap();
-            if remove_edges {
-                phisical.add_edge(a, e.target(), *e.weight());
-            } else {
-                phisical.add_edge(a, e.target(), 0.0);
-            }
-            edge_id = e.id();
-            unconnected -= 1;
-            connected[e.target().index()] = true;
-            outdegree[a.index()] += 1;
-            indegree[e.target().index()] += 1;
-            a = e.target();
-        }
-        if remove_edges {
-            logical.remove_edge(edge_id);
-        }
+        let e:EdgeReference<_> = logical.edges_directed(a, Direction::Outgoing)
+            .filter(|e| !connected[e.target().index()])
+            .max_by(|e1, e2| {
+                match e2.weight().partial_cmp(e1.weight()) {
+                    Some(o) => o,
+                    None => std::cmp::Ordering::Equal
+                }
+            }).unwrap();
+        phisical.add_edge(a, e.target(), 0.0);
+        unconnected -= 1;
+        connected[e.target().index()] = true;
+        outdegree[a.index()] += 1;
+        indegree[e.target().index()] += 1;
+        a = e.target();
     }
-    let e = logical.find_edge(a, NodeIndex::new(start)).unwrap();
-    if remove_edges {
-        phisical.add_edge(a, NodeIndex::new(start), *logical.edge_weight(e).unwrap());
-        logical.remove_edge(e);
-    } else {
-        phisical.add_edge(a, NodeIndex::new(start), 0.0);
-    }
+    phisical.add_edge(a, NodeIndex::new(start), 0.0);
+    outdegree[a.index()] += 1;
+    indegree[start] += 1;
 
     // If there is still space, try to add more arcs, starting from the heaviest
     let mut sorted_edges = Vec::from(logical.raw_edges());
@@ -227,14 +284,10 @@ fn create_opportunistic_physical_topology(logical: &mut Graph<usize, f64>, remov
         for e in &sorted_edges {
             if outdegree[e.source().index()] < delta && indegree[e.target().index()] < delta
                 && !phisical.contains_edge(e.source(), e.target()){
-                    if remove_edges {
-                        phisical.add_edge(e.source(), e.target(), e.weight);
-                    } else {
-                        phisical.add_edge(e.source(), e.target(), 0.0);
-                    }
+                    phisical.add_edge(e.source(), e.target(), 0.0);
                     outdegree[e.source().index()] += 1;
                     indegree[e.target().index()] += 1;
-            }
+                }
         }
     }
     phisical
@@ -288,28 +341,21 @@ fn create_manhattan_physical_topology(n:usize, r:usize) -> Graph<usize, f64>{
     physical
 }
 
-fn output_result(g: &Graph<usize, f64>, output_file: Option<PathBuf>) {
+fn output_result(g: &Graph<usize, f64>, p: PathBuf) {
     let dot = Dot::new(g);
 
-    match output_file {
-        None => println!("{:?}", dot),
-        Some(p) => {
-            let mut type_arg = OsString::from("-T");
-            if let Some(ext) = p.extension(){
-                type_arg.push(ext);
-            } else {
-                type_arg.push("dot");
-            }
-            let mut graphviz = Command::new("dot")
-                .arg(type_arg)
-                .arg("-o")
-                .arg(p)
-                .stdin(Stdio::piped())
-                .spawn().expect("Failed to run graphviz' dot command");
-            {
-                let mut stdin = graphviz.stdin.as_mut().expect("Failed to open graphviz' dot stdin");
-                write!(&mut stdin, "{:?}", dot).unwrap();
-            }
-        }
+    let mut type_arg = OsString::from("-T");
+    if let Some(ext) = p.extension(){
+        type_arg.push(ext);
+    } else {
+        type_arg.push("dot");
     }
+    let mut graphviz = Command::new("dot")
+        .arg(type_arg)
+        .arg("-o")
+        .arg(p)
+        .stdin(Stdio::piped())
+        .spawn().expect("Failed to run graphviz' dot command");
+    let mut stdin = graphviz.stdin.as_mut().expect("Failed to open graphviz' dot stdin");
+    write!(&mut stdin, "{:?}", dot).unwrap();
 }
