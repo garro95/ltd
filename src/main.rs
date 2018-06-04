@@ -28,7 +28,7 @@ use std::collections::VecDeque;
 use petgraph::prelude::*;
 use petgraph::graph::EdgeReference;
 use petgraph::dot::Dot;
-use petgraph::algo::{DfsSpace, astar, has_path_connecting};
+use petgraph::algo::{DfsSpace, astar, has_path_connecting, toposort};
 
 use rand::{SeedableRng, XorShiftRng, distributions::{Sample, Range}};
 use rand::seq::sample_slice;
@@ -88,21 +88,20 @@ main!(|args:Interface| {
 
     // Assign all the traffic to the existing paths.
     if args.splittable {
-        // TODO: case of splitted traffic
         let edges = logical.raw_edges();
         //take the edges in random order
         let edges = sample_slice(&mut rng, edges, edges.len());
         let mut aux_graph = phisical.clone();
         let mut q = VecDeque::new();
         let mut taken = vec![false; args.n];
-        let mut state = vec![(0, 0.0);args.n]; //(occurrencies, traffic to deliver)
+        let mut state = vec![0.0;args.n]; //traffic to deliver
         for e in edges {
             aux_graph.clear_edges();
             for t in &mut taken{
                 *t = false;
             }
             for s in &mut state {
-                *s = (0, 0.0);
+                *s = 0.0;
             }
             let a = e.source();
             let t = e.target();
@@ -113,35 +112,28 @@ main!(|args:Interface| {
                 if a != t && !taken[a.index()] {
                     taken[a.index()] = true;
                     let neighbors = phisical.neighbors(a).filter(|n| !taken[n.index()]);
-                    neighbors.clone().map(|n| state[n.index()]).for_each(|mut t| {t.0+=1;});
+                    //neighbors.clone().map(|n| state[n.index()]).for_each(|mut t| {t.0+=1;});
                     q.extend(neighbors.clone());
                     aux_graph.extend_with_edges(neighbors.map(|n| (a, n, 0.0)));
                 }
             }
             // divide the flow on the arcs
-            for t in &mut taken{
-                *t = false;
-            }
-            q.push_back(a);
-            state[a.index()].1 = w;
             let mut space = DfsSpace::new(&aux_graph);
-            while let Some(a) = q.pop_front() {
-                if a!= t && !taken[a.index()] {
-                    taken[a.index()] = true;
-                    let neighbors_to_split: Vec<_> = aux_graph.neighbors(a)
-                        .filter(|n| has_path_connecting(&aux_graph, *n, t, Some(&mut space)))
-                        .collect();
-                    let divisor:usize = neighbors_to_split.iter().map(|n| state[n.index()].0).sum();
-                    for (n, mut s) in neighbors_to_split.iter().map(|n| (n, state[n.index()])) {
-                        /*s.1 += state[a.index()].1 / divisor * */
-                        let value = state[a.index()].1 / (neighbors_to_split.len() as f64);
-                        s.1 += value;
-                        let e;
-                        {
-                            e = phisical.find_edge(a, *n).unwrap();
-                        }
-                        *phisical.edge_weight_mut(e).unwrap() += value;
+            let nodes = toposort(&aux_graph, Some(&mut space)).expect("Do you remember the DAG? Well... it's not so Acyclic :-(");
+            assert_eq!(nodes[0], a);
+            state[a.index()] = w;
+            for n in nodes {
+                let neighbors: Vec<_> = aux_graph.neighbors(n)
+                    .filter(|n| has_path_connecting(&aux_graph, *n, t, Some(&mut space)))
+                    .collect();
+                let val = state[n.index()] / (neighbors.len() as f64);
+                for nn in neighbors {
+                    state[nn.index()] += val;
+                    let e;
+                    {
+                        e = phisical.find_edge(n, nn).unwrap();
                     }
+                    *phisical.edge_weight_mut(e).unwrap() += val;
                 }
             }
         }
@@ -171,8 +163,18 @@ main!(|args:Interface| {
                 }
             }
         }
-        // TODO: Check that all the traffic has been delivered
     }
+
+    assert_eq!(
+        (0..args.n).into_par_iter()
+            .map(|i| NodeIndex::new(i))
+            .map(|i|
+                 phisical.edges_directed(i, Direction::Outgoing).map(|er| er.weight()).sum::<f64>()
+                 + logical.edges_directed(i, Direction::Incoming).map(|er| er.weight()).sum::<f64>()
+                 - phisical.edges_directed(i, Direction::Incoming).map(|er| er.weight()).sum::<f64>()
+                 - logical.edges_directed(i, Direction::Outgoing).map(|er| er.weight()).sum::<f64>())
+            .filter(|d| *d>0.01)
+            .count(), 0);
 
     println!("{}", phisical.edge_weights_mut().max_by(|a, b| {
         match a.partial_cmp(&b) {
