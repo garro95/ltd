@@ -123,8 +123,8 @@ main!(|args:Interface| {
     }
 
     if args.splittable {
-        let mut p = phisical.clone();
         for _ in 0..args.n/3 {
+            let mut p = phisical.clone();
             let e = p.raw_edges().par_iter()
                 .max_by(|e1, e2| {
                     match e1.weight.partial_cmp(&e2.weight) {
@@ -134,17 +134,28 @@ main!(|args:Interface| {
                 }).unwrap().clone();
             let etr = {p.find_edge(e.source(), e.target())}.unwrap();
             p.remove_edge(etr).unwrap();
-            let path = astar(&p, e.source(), |t| t==e.target(), |e| *e.weight(), |_| 0.0).unwrap_or_else(|| continue).1;
+            let path = astar(&p, e.source(), |t| t==e.target(), |e| *e.weight(), |_| 0.0);
+            let path = if let Some(p) = path {
+                p.1
+            } else {
+                continue
+            };
             let mut a = path[0];
             let m = path.iter().zip(path.iter().skip(1))
                 .map(|(a, b)| phisical.find_edge(*a, *b).unwrap())
                 .max_by(|e1, e2| {
-                    match p.edge_weight(*e1).unwrap().partial_cmp(p.edge_weight(*e2).unwrap()) {
+                    match phisical.edge_weight(*e1).unwrap().partial_cmp(phisical.edge_weight(*e2).unwrap()) {
                         Some(o) => o,
                         None => Ordering::Equal
                     }
-                }).unwrap();
-            let val = p.edge_weight(m).unwrap();
+                });
+            let m = if let Some(m) = m {
+                m
+            } else {
+                println!("{:?}", path);
+                continue
+            };
+            let val = phisical.edge_weight(m).unwrap().clone();
             let new_weight = (e.weight + val)/2.0;
             let overflow = e.weight - new_weight;
             for b in path.into_iter().skip(1) {
