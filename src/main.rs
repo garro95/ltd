@@ -23,12 +23,21 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::ffi::OsString;
 use std::io::Write;
-use std::collections::VecDeque;
+use std::collections::{VecDeque, hash_map::{HashMap, Entry::{Occupied, Vacant}}, BinaryHeap};
+use std::hash::Hash;
+use std::cmp::Ordering;
 
 use petgraph::prelude::*;
 use petgraph::graph::EdgeReference;
 use petgraph::dot::Dot;
-use petgraph::algo::{DfsSpace, astar, has_path_connecting, toposort};
+use petgraph::algo::{Measure, DfsSpace, astar, has_path_connecting, toposort};
+use petgraph::visit::{
+    EdgeRef,
+    GraphBase,
+    IntoEdges,
+    VisitMap,
+    Visitable,
+};
 
 use rand::{SeedableRng, XorShiftRng, distributions::{Sample, Range}};
 use rand::seq::sample_slice;
@@ -87,95 +96,66 @@ main!(|args:Interface| {
     };
 
     // Assign all the traffic to the existing paths.
-    if args.splittable {
-        let edges = logical.raw_edges();
-        //take the edges in random order
-        let edges = sample_slice(&mut rng, edges, edges.len());
-        let mut aux_graph = phisical.clone();
-        let mut q = VecDeque::new();
-        let mut taken = vec![false; args.n];
-        let mut state = vec![0.0;args.n]; //traffic to deliver
-        for e in edges {
-            aux_graph.clear_edges();
-            for t in &mut taken{
-                *t = false;
-            }
-            for s in &mut state {
-                *s = 0.0;
-            }
-            let a = e.source();
-            let t = e.target();
-            let w = e.weight;
-            q.push_back(a);
-            // create a DAG
-            while let Some(a) = q.pop_front() {
-                if a != t && !taken[a.index()] {
-                    taken[a.index()] = true;
-                    let neighbors = phisical.neighbors(a).filter(|n| !taken[n.index()]);
-                    //neighbors.clone().map(|n| state[n.index()]).for_each(|mut t| {t.0+=1;});
-                    q.extend(neighbors.clone());
-                    aux_graph.extend_with_edges(neighbors.map(|n| (a, n, 0.0)));
-                }
-            }
-            // divide the flow on the arcs
-            let mut space = DfsSpace::new(&aux_graph);
-            let nodes = toposort(&aux_graph, Some(&mut space)).expect("Do you remember the DAG? Well... it's not so Acyclic :-(");
-            assert_eq!(nodes[0], a);
-            state[a.index()] = w;
-            for n in nodes {
-                let neighbors: Vec<_> = aux_graph.neighbors(n)
-                    .filter(|n| has_path_connecting(&aux_graph, *n, t, Some(&mut space)))
-                    .collect();
-                let val = state[n.index()] / (neighbors.len() as f64);
-                for nn in neighbors {
-                    state[nn.index()] += val;
-                    let e;
-                    {
-                        e = phisical.find_edge(n, nn).unwrap();
-                    }
-                    *phisical.edge_weight_mut(e).unwrap() += val;
-                }
-            }
+    let edges = Vec::from(phisical.raw_edges());
+    for (i, e) in phisical.edge_weights_mut().enumerate() {
+        let (from, to) = (edges[i].source(), edges[i].target());
+        let idx = logical.find_edge(from, to).unwrap();
+        let weight = logical.edge_weight(idx).unwrap();
+        *e = *weight;
+    }
+    let mut sorted_edges = Vec::from(logical.raw_edges());
+    sorted_edges.par_sort_unstable_by(|e1, e2| {
+        match e2.weight.partial_cmp(&e1.weight) {
+            Some(o) => o,
+            None => std::cmp::Ordering::Equal
         }
-    } else {
-        let edges = Vec::from(phisical.raw_edges());
-        for (i, e) in phisical.edge_weights_mut().enumerate() {
-            let (from, to) = (edges[i].source(), edges[i].target());
-            let idx = logical.find_edge(from, to).unwrap();
-            let weight = logical.edge_weight(idx).unwrap();
-            *e = *weight;
-        }
-        let mut sorted_edges = Vec::from(logical.raw_edges());
-        sorted_edges.par_sort_unstable_by(|e1, e2| {
-            match e2.weight.partial_cmp(&e1.weight) {
-                Some(o) => o,
-                None => std::cmp::Ordering::Equal
+    });
+    for e in sorted_edges {
+        if !phisical.contains_edge(e.source(), e.target()) {
+            let path = astar(&phisical, e.source(), |t| t == e.target(), |e| *e.weight(), |_| 0.0).unwrap().1;
+            let mut a = path[0];
+            for b in path.into_iter().skip(1) {
+                let te = phisical.find_edge(a, b).unwrap();
+                *(phisical.edge_weight_mut(te).unwrap()) += e.weight;
+                a = b;
             }
-        });
-        for e in sorted_edges {
-            if !phisical.contains_edge(e.source(), e.target()) {
-                let path = astar(&phisical, e.source(), |t| t == e.target(), |e| *e.weight(), |_| 0.0).unwrap().1;
-                let mut a = path[0];
-                for b in path.into_iter().skip(1) {
-                    let te = phisical.find_edge(a, b).unwrap();
-                    *(phisical.edge_weight_mut(te).unwrap()) += e.weight;
-                    a = b;
-                }
-            }
-        }
+        }        
     }
 
-    assert_eq!(
-        (0..args.n).into_par_iter()
-            .map(|i| NodeIndex::new(i))
-            .map(|i|
-                 phisical.edges_directed(i, Direction::Outgoing).map(|er| er.weight()).sum::<f64>()
-                 + logical.edges_directed(i, Direction::Incoming).map(|er| er.weight()).sum::<f64>()
-                 - phisical.edges_directed(i, Direction::Incoming).map(|er| er.weight()).sum::<f64>()
-                 - logical.edges_directed(i, Direction::Outgoing).map(|er| er.weight()).sum::<f64>())
-            .filter(|d| *d>0.01)
-            .count(), 0);
-
+    if args.splittable {
+        let mut p = phisical.clone();
+        for _ in 0..args.n/3 {
+            let e = p.raw_edges().par_iter()
+                .max_by(|e1, e2| {
+                    match e1.weight.partial_cmp(&e2.weight) {
+                        Some(o) => o,
+                        None => std::cmp::Ordering::Equal
+                    }
+                }).unwrap().clone();
+            let etr = {p.find_edge(e.source(), e.target())}.unwrap();
+            p.remove_edge(etr).unwrap();
+            let path = astar(&p, e.source(), |t| t==e.target(), |e| *e.weight(), |_| 0.0).unwrap_or_else(|| continue).1;
+            let mut a = path[0];
+            let m = path.iter().zip(path.iter().skip(1))
+                .map(|(a, b)| phisical.find_edge(*a, *b).unwrap())
+                .max_by(|e1, e2| {
+                    match p.edge_weight(*e1).unwrap().partial_cmp(p.edge_weight(*e2).unwrap()) {
+                        Some(o) => o,
+                        None => Ordering::Equal
+                    }
+                }).unwrap();
+            let val = p.edge_weight(m).unwrap();
+            let new_weight = (e.weight + val)/2.0;
+            let overflow = e.weight - new_weight;
+            for b in path.into_iter().skip(1) {
+                let te = phisical.find_edge(a, b).unwrap();
+                *(phisical.edge_weight_mut(te).unwrap()) += overflow;
+                a = b;
+            }
+            let te = phisical.find_edge(e.source(), e.target()).unwrap();
+            *(phisical.edge_weight_mut(te).unwrap()) = new_weight;
+        }
+    }
     println!("{}", phisical.edge_weights_mut().max_by(|a, b| {
         match a.partial_cmp(&b) {
             Some(o) => o,
@@ -185,6 +165,19 @@ main!(|args:Interface| {
     if let Some(output_file) = args.output_file {
         output_result(&phisical, output_file);
     }
+    assert_eq!(
+        (0..args.n).into_par_iter()
+            .map(|i| NodeIndex::new(i))
+            .map(|i|
+                 phisical.edges_directed(i, Direction::Outgoing).map(|er| er.weight()).sum::<f64>()
+                 + logical.edges_directed(i, Direction::Incoming).map(|er| er.weight()).sum::<f64>()
+                 - phisical.edges_directed(i, Direction::Incoming).map(|er| er.weight()).sum::<f64>()
+                 - logical.edges_directed(i, Direction::Outgoing).map(|er| er.weight()).sum::<f64>())
+            .filter(|d| *d>0.01)
+            .map(|d| {println!("{}", d); d})
+            .count(), 0, "Unfeasible solution found: Not all traffic has been delivered or more then expected has been");
+
+
 });
 
 fn create_logical_topology(nodes:usize, rng: &mut XorShiftRng) -> Graph<usize, f64>{
@@ -360,4 +353,154 @@ fn output_result(g: &Graph<usize, f64>, p: PathBuf) {
         .spawn().expect("Failed to run graphviz' dot command");
     let mut stdin = graphviz.stdin.as_mut().expect("Failed to open graphviz' dot stdin");
     write!(&mut stdin, "{:?}", dot).unwrap();
+}
+
+fn max_astar<G, F, H, K, IsGoal>(graph: G, start: G::NodeId, mut is_goal: IsGoal,
+                                     mut edge_cost: F, mut estimate_cost: H)
+    -> Option<(K, Vec<G::NodeId>)>
+    where G: IntoEdges + Visitable,
+          IsGoal: FnMut(G::NodeId) -> bool,
+          G::NodeId: Eq + Hash,
+          F: FnMut(G::EdgeRef) -> K,
+          H: FnMut(G::NodeId) -> K,
+          K: Measure + Copy,
+{
+    let mut visited = graph.visit_map();
+    let mut visit_next = BinaryHeap::new();
+    let mut scores = HashMap::new();
+    let mut path_tracker = PathTracker::<G>::new();
+
+    let zero_score = K::default();
+    scores.insert(start, zero_score);
+    visit_next.push(MinScored(estimate_cost(start), start));
+
+    while let Some(MinScored(_, node)) = visit_next.pop() {
+        if is_goal(node) {
+            let path = path_tracker.reconstruct_path_to(node);
+            let cost = scores[&node];
+            return Some((cost, path));
+        }
+
+        // Don't visit the same node several times, as the first time it was visited it was using
+        // the shortest available path.
+        if !visited.visit(node) {
+            continue
+        }
+
+        // This lookup can be unwrapped without fear of panic since the node was necessarily scored
+        // before adding him to `visit_next`.
+        let node_score = scores[&node];
+
+        for edge in graph.edges(node) {
+            let next = edge.target();
+            if visited.is_visited(&next) {
+                continue
+            }
+
+            let mut next_score = if node_score > edge_cost(edge) {edge_cost(edge)} else {node_score};
+
+            match scores.entry(next) {
+                Occupied(ent) => {
+                    let old_score = *ent.get();
+                    if next_score < old_score {
+                        *ent.into_mut() = next_score;
+                        path_tracker.set_predecessor(next, node);
+                    } else {
+                        next_score = old_score;
+                    }
+                },
+                Vacant(ent) => {
+                    ent.insert(next_score);
+                    path_tracker.set_predecessor(next, node);
+                }
+            }
+
+            let next_estimate_score = if next_score > estimate_cost(next) {estimate_cost(next)} else {next_score};
+            visit_next.push(MinScored(next_estimate_score, next));
+        }
+    }
+
+    None
+}
+
+
+
+
+struct PathTracker<G>
+    where G: GraphBase,
+          G::NodeId: Eq + Hash,
+{
+    came_from: HashMap<G::NodeId, G::NodeId>,
+}
+
+impl<G> PathTracker<G>
+    where G: GraphBase,
+          G::NodeId: Eq + Hash,
+{
+    fn new() -> PathTracker<G> {
+        PathTracker {
+            came_from: HashMap::new(),
+        }
+    }
+
+    fn set_predecessor(&mut self, node: G::NodeId, previous: G::NodeId) {
+        self.came_from.insert(node, previous);
+    }
+
+    fn reconstruct_path_to(&self, last: G::NodeId) -> Vec<G::NodeId> {
+        let mut path = vec![last];
+
+        let mut current = last;
+        while let Some(&previous) = self.came_from.get(&current) {
+            path.push(previous);
+            current = previous;
+        }
+
+        path.reverse();
+
+        path
+    }
+}
+
+
+#[derive(Copy, Clone, Debug)]
+pub struct MinScored<K, T>(pub K, pub T);
+
+impl<K: PartialOrd, T> PartialEq for MinScored<K, T> {
+    #[inline]
+    fn eq(&self, other: &MinScored<K, T>) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl<K: PartialOrd, T> Eq for MinScored<K, T> {}
+
+impl<K: PartialOrd, T> PartialOrd for MinScored<K, T> {
+    #[inline]
+    fn partial_cmp(&self, other: &MinScored<K, T>) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<K: PartialOrd, T> Ord for MinScored<K, T> {
+    #[inline]
+    fn cmp(&self, other: &MinScored<K, T>) -> Ordering {
+        let a = &self.0;
+        let b = &other.0;
+        if a == b {
+            Ordering::Equal
+        } else if a < b {
+            Ordering::Greater
+        } else if a > b {
+            Ordering::Less
+        } else if a != a && b != b {
+            // these are the NaN cases
+            Ordering::Equal
+        } else if a != a {
+            // Order NaN less, so that it is last in the MinScore order
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }
+    }
 }
