@@ -134,12 +134,7 @@ main!(|args:Interface| {
                 }).unwrap().clone();
             let etr = {p.find_edge(e.source(), e.target())}.unwrap();
             p.remove_edge(etr).unwrap();
-            let path = astar(&p, e.source(), |t| t==e.target(), |e| *e.weight(), |_| 0.0);
-            let path = if let Some(p) = path {
-                p.1
-            } else {
-                continue
-            };
+            let path = astar(&p, e.source(), |t| t==e.target(), |e| *e.weight(), |_| 0.0).unwrap().1;
             let mut a = path[0];
             let m = path.iter().zip(path.iter().skip(1))
                 .map(|(a, b)| phisical.find_edge(*a, *b).unwrap())
