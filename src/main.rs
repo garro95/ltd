@@ -24,25 +24,34 @@ use std::process::{Command, Stdio};
 use std::ffi::OsString;
 use std::io::Write;
 use std::cmp::Ordering;
+use std::rc::Rc;
+use std::cell::RefCell;
 
 use petgraph::prelude::*;
 use petgraph::graph::EdgeReference;
 use petgraph::dot::Dot;
 use petgraph::algo::astar;
-use petgraph::visit::{
-    EdgeRef,
-};
+use petgraph::visit::EdgeRef;
 
-use rand::{SeedableRng, XorShiftRng, distributions::{Sample, Range}};
+use rand::{
+    SeedableRng,
+    XorShiftRng,
+    distributions::{
+        Distribution,
+        Uniform,
+        WeightedChoice,
+        Weighted
+    }
+};
 
 use quicli::prelude::*;
 
-fn parse_seed(seed: &str) -> [u32;4] {
+fn parse_seed(seed: &str) -> [u8;16] {
     let mut seed:u128 = seed.parse().expect("Unable to parse random seed");
-    let mut parsed = [0;4];
-    for i in 1..=4 {
-        parsed[4-i] = (seed & std::u32::MAX as u128) as u32;
-        seed = seed >> 32;
+    let mut parsed = [0;16];
+    for i in 1..=16 {
+        parsed[16-i] = (seed & std::u32::MAX as u128) as u8;
+        seed = seed >> 8;
     }
     parsed
 }
@@ -63,7 +72,7 @@ struct Interface {
     /// in order to be consistent between two run. You can change it to change the result
     /// of the computation. Can be an integer ranging from 1 up to 340,282,366,920,938,463,463,374,607,431,768,211,455
     #[structopt(long="seed", short="s", default_value="1234", parse(from_str="parse_seed"))]
-    seed: [u32;4],
+    seed: [u8;16],
     /// If specified, the final computed graph will be output on the specified file using graphviz.
     /// The type of the output file will be desumed from the extension. If the extension is not
     /// specified, will default to dot
@@ -75,15 +84,25 @@ struct Interface {
     splittable: bool,
     /// Specify if a manhattan topology should be used and, in that case, the length of a row
     #[structopt(long="manhattan", short="m")]
-    manhattan: Option<usize>
+    manhattan: Option<usize>,
+    /// Specify if the traffic should be unbalanced, i.e. if the 10% of
+    /// the nodes should exchange more traffic
+    #[structopt(long="unbalanced", short="u")]
+    unbalanced: bool,
+    /// Specify that the physical topology should be generated at random instead of
+    /// opportunistically
+    #[structopt(long="random", short="R")]
+    random: bool
 }
 
 main!(|args:Interface| {
     let mut rng = XorShiftRng::from_seed(args.seed);
-    let logical = create_logical_topology(args.n, &mut rng);
+    let logical = create_logical_topology(args.n, &mut rng, args.unbalanced);
     // Heuristically find a heavy Hamilton cycle (like a multi start)
     let mut phisical = if let Some(r) = args.manhattan {
         create_manhattan_physical_topology(logical.node_count(), r)
+    } else if args.random {
+        create_random_physical_topology(args.n, args.delta, &mut rng)
     } else {
         create_opportunistic_physical_topology(&logical, args.delta)
     };
@@ -179,9 +198,7 @@ main!(|args:Interface| {
 
 });
 
-fn create_logical_topology(nodes:usize, rng: &mut XorShiftRng) -> Graph<usize, f64>{
-    let mut traffic_values = Range::new(0.0, 1.0);
-
+fn create_logical_topology(nodes:usize, rng: &mut XorShiftRng, unbalanced: bool) -> Graph<usize, f64>{
     // Create a logical topology that describes the traffic from one node to each other.
     let mut logic = Graph::new();
 
@@ -189,12 +206,30 @@ fn create_logical_topology(nodes:usize, rng: &mut XorShiftRng) -> Graph<usize, f
         logic.add_node(i);
     }
 
-    for from in 0usize..nodes {
-        for to in (0usize..nodes).filter(|&a| a != from) {
-            logic.add_edge(NodeIndex::new(from), NodeIndex::new(to), traffic_values.sample(rng));
+    if unbalanced{
+        let high_traffic = Rc::new(RefCell::new(Uniform::new(5.0, 15.0)));
+        let low_traffic = Rc::new(RefCell::new(Uniform::new(0.0, 1.0)));
+        let mut weights = vec![Weighted{weight: 1, item: high_traffic},
+                               Weighted{weight: 9, item: low_traffic}];
+        let wc = WeightedChoice::new(&mut weights);
+
+        for from in 0usize..nodes {
+            for to in (0usize..nodes).filter(|&a| a != from) {
+                let w = wc.sample(rng);
+                logic.add_edge(NodeIndex::new(from), NodeIndex::new(to), w.borrow_mut().sample(rng));
+            }
         }
+        logic
+    } else {
+        let traffic_values = Uniform::new(0.0, 1.0);
+
+        for from in 0usize..nodes {
+            for to in (0usize..nodes).filter(|&a| a != from) {
+                logic.add_edge(NodeIndex::new(from), NodeIndex::new(to), traffic_values.sample(rng));
+            }
+        }
+        logic
     }
-    logic
 }
 
 fn find_start(logic: &Graph<usize, f64>) -> usize {
@@ -229,6 +264,29 @@ fn find_start(logic: &Graph<usize, f64>) -> usize {
     });
 
     max_weight.into_inner().unwrap().0
+}
+
+///Create a random graph
+fn create_random_physical_topology(n:usize, delta:usize, rng: &mut XorShiftRng) -> Graph<usize, f64> {
+    let mut phisical: Graph<usize, f64> = Graph::new();
+    for i in 0..n {
+        phisical.add_node(i);
+    }
+
+    let uniform = Uniform::new(0, n);
+    let mut outdegree = vec![0;n];
+    for from in 0..n {
+        for _ in 0..delta {
+            let mut to = uniform.sample(rng);
+            while outdegree[to] == delta {
+                to = uniform.sample(rng);
+            }
+            outdegree[to] += 1;
+            phisical.add_edge(NodeIndex::new(from), NodeIndex::new(to), 0.0);
+        }
+    }
+
+    phisical
 }
 
 fn create_opportunistic_physical_topology(logical: &Graph<usize, f64>, delta: usize)
