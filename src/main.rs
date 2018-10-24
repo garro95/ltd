@@ -18,20 +18,24 @@ extern crate rand;
 extern crate rayon;
 #[macro_use] extern crate quicli;
 
-use std::sync::RwLock;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::ffi::OsString;
-use std::io::Write;
-use std::cmp::Ordering;
-use std::rc::Rc;
-use std::cell::RefCell;
+use std::{
+    sync::RwLock,
+    path::PathBuf,
+    process::{Command, Stdio},
+    ffi::OsString,
+    io::Write,
+    cmp::Ordering,
+    rc::Rc,
+    cell::RefCell,
+}
 
-use petgraph::prelude::*;
-use petgraph::graph::EdgeReference;
-use petgraph::dot::Dot;
-use petgraph::algo::astar;
-use petgraph::visit::EdgeRef;
+use petgraph::{
+    prelude::*,
+    graph::EdgeReference,
+    dot::Dot,
+    algo::astar,
+    visit::EdgeRef,
+}
 
 use rand::{
     SeedableRng,
@@ -88,11 +92,7 @@ struct Interface {
     /// Specify if the traffic should be unbalanced, i.e. if the 10% of
     /// the nodes should exchange more traffic
     #[structopt(long="unbalanced", short="u")]
-    unbalanced: bool,
-    /// Specify that the physical topology should be generated at random instead of
-    /// opportunistically
-    #[structopt(long="random", short="R")]
-    random: bool
+    unbalanced: bool
 }
 
 main!(|args:Interface| {
@@ -107,14 +107,21 @@ main!(|args:Interface| {
         create_opportunistic_physical_topology(&logical, args.delta)
     };
 
+    // N: Number of nodes
+    // D: delta
+    // C: Number of  computing cores
+
     // Assign all the traffic to the existing paths.
     let edges = Vec::from(phisical.raw_edges());
+    // O(N*D)
     for (i, e) in phisical.edge_weights_mut().enumerate() {
         let (from, to) = (edges[i].source(), edges[i].target());
         let idx = logical.find_edge(from, to).unwrap();
         let weight = logical.edge_weight(idx).unwrap();
         *e = *weight;
     }
+    // Sort the edges and route the traffic starting from the heaviest amount
+    // O(N²log(N)/C)
     let mut sorted_edges = Vec::from(logical.raw_edges());
     sorted_edges.par_sort_unstable_by(|e1, e2| {
         match e2.weight.partial_cmp(&e1.weight) {
@@ -122,19 +129,27 @@ main!(|args:Interface| {
             None => std::cmp::Ordering::Equal
         }
     });
+    // O(N²)
     for e in sorted_edges {
         if !phisical.contains_edge(e.source(), e.target()) {
-            let path = astar(&phisical, e.source(), |t| t == e.target(), |e| *e.weight(), |_| 0.0).unwrap().1;
+            // Astar is an informed version of the djikstra algorithm.
+            // Complexity: O(N*D + N log(N))
+            let path = astar(&phisical,
+                             e.source(),
+                             |t| t == e.target(),
+                             |e| *e.weight(),
+                             |_| 0.0).unwrap().1;
             let mut a = path[0];
+            // O(N) worst case
             for b in path.into_iter().skip(1) {
                 let te = phisical.find_edge(a, b).unwrap();
                 *(phisical.edge_weight_mut(te).unwrap()) += e.weight;
                 a = b;
             }
-        }        
+        }
     }
 
-    if args.splittable {
+    if args.splittable && args.delta > 1{
         for _ in 0..args.n/3 {
             let mut p = phisical.clone();
             let e = p.raw_edges().par_iter()
@@ -146,6 +161,7 @@ main!(|args:Interface| {
                 }).unwrap().clone();
             let etr = {p.find_edge(e.source(), e.target())}.unwrap();
             p.remove_edge(etr).unwrap();
+            // O(N² + N log(N))
             let path = astar(&p, e.source(), |t| t==e.target(), |e| *e.weight(), |_| 0.0).unwrap().1;
             let mut a = path[0];
             let m = path.iter().zip(path.iter().skip(1))
@@ -174,12 +190,7 @@ main!(|args:Interface| {
             *(phisical.edge_weight_mut(te).unwrap()) = new_weight;
         }
     }
-    println!("{}", phisical.edge_weights_mut().max_by(|a, b| {
-        match a.partial_cmp(&b) {
-            Some(o) => o,
-            None => std::cmp::Ordering::Equal
-        }
-    }).unwrap());
+    println!("{}", compute_fmax(phisical));
     if let Some(output_file) = args.output_file {
         output_result(&phisical, output_file);
     }
@@ -266,22 +277,43 @@ fn find_start(logic: &Graph<usize, f64>) -> usize {
     max_weight.into_inner().unwrap().0
 }
 
-///Create a random graph
+/// Create a random graph
 fn create_random_physical_topology(n:usize, delta:usize, rng: &mut XorShiftRng) -> Graph<usize, f64> {
     let mut phisical: Graph<usize, f64> = Graph::new();
     for i in 0..n {
         phisical.add_node(i);
     }
 
+    // first create a random hamilton cycle
     let uniform = Uniform::new(0, n);
-    let mut outdegree = vec![0;n];
+    let mut indegree = vec![0; n];
+    let start = uniform.sample(rng);
+    indegree[start] += 1;
+    let start = NodeIndex::new(start);
+    let mut unconnected = n-1;
+    let mut a = start;
+    while unconnected > 0 {
+        // find a node that was never considered
+        let mut to = uniform.sample(rng);
+        while indegree[to] > 0 || to == a.index() {
+            to = uniform.sample(rng);
+        }
+        indegree[to] += 1;
+        let to = NodeIndex::new(to);
+        phisical.add_edge(a, to, 0.0);
+        a = to;
+        unconnected -= 1
+    }
+    phisical.add_edge(a, start, 0.0);
+
+    // then insert delta-1 random arcs outgoing from each node
     for from in 0..n {
-        for _ in 0..delta {
+        for _ in 0..(delta-1) {
             let mut to = uniform.sample(rng);
-            while outdegree[to] == delta {
+            while indegree[to] == delta || to == from {
                 to = uniform.sample(rng);
             }
-            outdegree[to] += 1;
+            indegree[to] += 1;
             phisical.add_edge(NodeIndex::new(from), NodeIndex::new(to), 0.0);
         }
     }
@@ -391,6 +423,15 @@ fn create_manhattan_physical_topology(n:usize, r:usize) -> Graph<usize, f64>{
     }
 
     physical
+}
+
+fn compute_fmax(graph) -> f64 {
+    graph.edge_weights().max_by(|a, b| {
+        match a.partial_cmp(&b) {
+            Some(o) => o,
+            None => std::cmp::Ordering::Equal
+        }
+    }).unwrap()
 }
 
 fn output_result(g: &Graph<usize, f64>, p: PathBuf) {
